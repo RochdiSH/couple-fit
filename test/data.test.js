@@ -82,6 +82,17 @@ test('validates stable program identifiers and exactly four named sessions', () 
   assert.throws(() => validateProgram({ ...program, id: '' }), /identifiant/i);
 });
 
+test('validates RIR ranges and preserves timed or per-leg repetition units', () => {
+  const ranged = structuredClone(program);
+  ranged.sessions[0].exercises = [{ id: 'split-squat', name: 'Fentes bulgares', sets: 2, repMin: 8, repMax: 12, repQualifier: 'par jambe', rir: 1, rirMax: 2, restSeconds: 120 }];
+  assert.equal(validateProgram(ranged).sessions[0].exercises[0].rirMax, 2);
+  const timed = structuredClone(program);
+  timed.sessions[0].exercises = [{ id: 'plank', name: 'Gainage planche', sets: 2, repMin: 30, repMax: 60, repUnit: 'seconds', rir: 2, restSeconds: 60 }];
+  assert.equal(validateProgram(timed).sessions[0].exercises[0].repUnit, 'seconds');
+  assert.throws(() => validateProgram({ ...ranged, sessions: ranged.sessions.map((session, index) => index ? session : { ...session, exercises: [{ ...ranged.sessions[0].exercises[0], rirMax: 0 }] }) }), /rir/i);
+  assert.throws(() => validateProgram({ ...timed, sessions: timed.sessions.map((session, index) => index ? session : { ...session, exercises: [{ ...timed.sessions[0].exercises[0], repUnit: 'minutes' }] }) }), /unité/i);
+});
+
 test('creates an active cycle with a frozen program snapshot and default duration', () => {
   const cycle = createCycle(program, 1_000);
   assert.equal(cycle.profileId, 'me');
@@ -209,7 +220,7 @@ test('a populated V2 backup round-trips programs, cycles, stable exercise ids an
 test('the service worker pre-caches the module at paths relative to a GitHub Pages subdirectory', async () => {
   const worker = await readFile(new URL('../sw.js', import.meta.url), 'utf8');
   const app = await readFile(new URL('../app.js', import.meta.url), 'utf8');
-  const assetsSource = worker.match(/const ASSETS=\[(.*?)\]/)?.[1] || '';
+  const assetsSource = worker.match(/const ASSETS\s*=\s*\[(.*?)\]/s)?.[1] || '';
   const assets = [...assetsSource.matchAll(/'([^']+)'/g)].map(match => match[1]);
   const deploymentBase = 'https://example.github.io/couple-fit/sw.js';
   const cachedUrls = assets.map(asset => new URL(asset, deploymentBase).pathname);

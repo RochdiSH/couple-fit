@@ -144,8 +144,11 @@ export function validateProgram(program, expectedProfileId) {
       requireString(exercise.name, 'Nom d’exercice');
       if (!Number.isInteger(exercise.sets) || exercise.sets < 1 || exercise.sets > 30) throw new Error('Nombre de séries invalide');
       if (!Number.isInteger(exercise.repMin) || !Number.isInteger(exercise.repMax) || exercise.repMin < 1 || exercise.repMax < exercise.repMin || exercise.repMax > 200) throw new Error('Plage de répétitions invalide');
-      if (!Number.isFinite(exercise.rir) || exercise.rir < 0 || exercise.rir > 10) throw new Error('RIR invalide');
+      if (!Number.isFinite(exercise.rir) || exercise.rir < 0 || exercise.rir > 10
+        || (exercise.rirMax !== undefined && (!Number.isFinite(exercise.rirMax) || exercise.rirMax < exercise.rir || exercise.rirMax > 10))) throw new Error('RIR invalide');
       if (!Number.isInteger(exercise.restSeconds) || exercise.restSeconds < 0 || exercise.restSeconds > 3600) throw new Error('Temps de repos invalide');
+      if (exercise.repUnit !== undefined && !['reps', 'seconds'].includes(exercise.repUnit)) throw new Error('Unité de répétition invalide');
+      if (exercise.repQualifier !== undefined && typeof exercise.repQualifier !== 'string') throw new Error('Précision de répétition invalide');
     }
   }
   return program;
@@ -327,6 +330,42 @@ export function createRepository(db, profileId, { now = Date.now, makeId = () =>
     getProfileState: async () => (await read('profileState', profileId)) || { profileId, activeCycleId: null, updatedAt: now() },
     getActiveSession: async () => (await read('meta', 'activeSession'))?.data || null,
     getRestUntil: async () => (await read('meta', 'rest'))?.until || 0,
+    ensureBuiltInPrograms: async catalog => {
+      if (!Array.isArray(catalog)) throw new Error('Catalogue de programmes invalide');
+      const catalogIds = new Set();
+      for (const program of catalog) {
+        validateProgram(program, profileId);
+        if (catalogIds.has(program.id)) throw new Error(`Identifiant de programme prédéfini en double : ${program.id}`);
+        catalogIds.add(program.id);
+      }
+      const tx = db.transaction(['programs', 'syncMeta', 'outbox'], 'readwrite');
+      const programs = tx.objectStore('programs'), meta = tx.objectStore('syncMeta');
+      const programRequest = programs.getAll(), initializedRequest = meta.get('initialized');
+      const inserted = await new Promise((resolve, reject) => {
+        let loaded = 0, existing = [];
+        const fail = error => { try { tx.abort(); } catch {} reject(error); };
+        const apply = () => {
+          if (++loaded !== 2) return;
+          if (initializedRequest.result?.value !== true) return resolve([]);
+          const existingIds = new Set(existing.map(program => program.id));
+          const missing = catalog.filter(program => !existingIds.has(program.id));
+          if (!missing.length) return resolve([]);
+          const timestamp = now();
+          const records = missing.map(program => ({ ...structuredClone(program), createdAt: timestamp, updatedAt: timestamp }));
+          try {
+            for (const program of records) programs.put(program);
+            queueOutbox(tx, records.map(program => changeRecord('program', program.id, program)));
+            resolve(records.map(program => program.id));
+          } catch (error) { fail(error); }
+        };
+        programRequest.onsuccess = () => { existing = programRequest.result || []; apply(); };
+        initializedRequest.onsuccess = apply;
+        programRequest.onerror = initializedRequest.onerror = () => fail(new Error('Impossible de préparer les programmes prédéfinis'));
+      });
+      await transactionDone(tx);
+      if (inserted.length) signalMutation();
+      return inserted;
+    },
     saveActiveSession: async session => {
       const value = { ...session, profileId };
       const tx = db.transaction(['meta', 'outbox'], 'readwrite');
@@ -690,7 +729,9 @@ export function createRepository(db, profileId, { now = Date.now, makeId = () =>
               profileState: remoteKeys.has(syncKey('profile_state', 'profile')) ? null : local.profileState,
               activeSession: remoteKeys.has(syncKey('active_session', 'current')) ? null : local.activeSession
             };
-            const batches = snapshotSyncBatches(localOnly, { includeProfileState: Boolean(localOnly.profileState) });
+            const knownProgramIds = new Set(records.filter(row => row.entity === 'program').map(row => row.record_id));
+            const knownDeletedProgramIds = new Set(records.filter(row => row.entity === 'program' && row.deleted_at).map(row => row.record_id));
+            const batches = snapshotSyncBatches(localOnly, { includeProfileState: Boolean(localOnly.profileState), knownProgramIds, knownDeletedProgramIds });
             for (const changes of batches) outbox.add({ opId: makeId(), profileId, createdAt: now(), changes: structuredClone(changes), status: 'pending' });
             meta.put({ id: 'initialized', value: true }); meta.put({ id: 'historyCursor', value: String(cursor || '0') });
             resolve({ conflicts: [], batches });

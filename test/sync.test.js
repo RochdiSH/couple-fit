@@ -149,3 +149,35 @@ test('bootstrap snapshot groups the active cycle with profile state and sends ac
   assert.equal(batches.at(-1)[0].record_id, 'current');
   assert.ok(batches.every(batch => batch.length <= 100));
 });
+
+test('historical cycle snapshots can bootstrap a tombstoned program missing from the current library', () => {
+  const archivedProgram = { id: 'archived-program', profileId: 'me', name: 'Archive', durationWeeks: 8, revision: 1, sessions: [
+    ['upper-a', 'Upper A'], ['lower-a', 'Lower A'], ['upper-b', 'Upper B'], ['lower-b', 'Lower B']
+  ].map(([id, name]) => ({ id, name, exercises: [] })) };
+  const cycle = { id: 'cycle-old', profileId: 'me', programId: archivedProgram.id, programSnapshot: archivedProgram, status: 'completed' };
+  const batches = snapshotSyncBatches({ profileId: 'me', programs: [], cycles: [cycle], sessions: [], profileState: { profileId: 'me', activeCycleId: null } });
+  assert.equal(batches[0][0].entity, 'program');
+  assert.equal(batches[0][0].deleted, true);
+  assert.equal(batches[1][0].entity, 'cycle');
+});
+
+test('merge bootstrap does not recreate a program record already present in the cloud', () => {
+  const archivedProgram = { id: 'archived-program', profileId: 'me', name: 'Archive', durationWeeks: 8, revision: 1, status: 'archived', sessions: [] };
+  const cycle = { id: 'cycle-old', profileId: 'me', programId: archivedProgram.id, programSnapshot: archivedProgram, status: 'completed' };
+  const batches = snapshotSyncBatches({ profileId: 'me', programs: [], cycles: [cycle], sessions: [], profileState: null }, {
+    includeProfileState: false, knownProgramIds: new Set([archivedProgram.id])
+  });
+  assert.deepEqual(batches.map(batch => batch[0].entity), ['cycle']);
+});
+
+test('active cycle snapshot cannot be bootstrapped without its program record', () => {
+  const cycle = { id: 'cycle-active', profileId: 'me', programId: 'missing', programSnapshot: { id: 'missing', profileId: 'me' }, status: 'active' };
+  assert.throws(() => snapshotSyncBatches({ profileId: 'me', programs: [], cycles: [cycle], sessions: [], profileState: { profileId: 'me', activeCycleId: cycle.id } }), /programme absent/);
+});
+
+test('active cycle cannot be merged against a tombstoned cloud program', () => {
+  const cycle = { id: 'cycle-active', profileId: 'me', programId: 'deleted', programSnapshot: { id: 'deleted', profileId: 'me' }, status: 'active' };
+  assert.throws(() => snapshotSyncBatches({ profileId: 'me', programs: [], cycles: [cycle], sessions: [], profileState: { profileId: 'me', activeCycleId: cycle.id } }, {
+    knownProgramIds: new Set(['deleted']), knownDeletedProgramIds: new Set(['deleted'])
+  }), /programme supprimé/);
+});

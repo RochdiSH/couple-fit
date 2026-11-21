@@ -1,12 +1,33 @@
 const PAGE_SIZE = 500;
 const MAX_BATCH_SIZE = 100;
 
-export function snapshotSyncBatches(snapshot, { includeProfileState = true } = {}) {
+export function snapshotSyncBatches(snapshot, { includeProfileState = true, knownProgramIds = new Set(), knownDeletedProgramIds = new Set() } = {}) {
   const batches = [];
   const changes = (entity, recordId, payload, deleted = false) => ({ entity, record_id: recordId, deleted, payload });
   const appendChunks = records => { for (let index = 0; index < records.length; index += MAX_BATCH_SIZE) batches.push(records.slice(index, index + MAX_BATCH_SIZE)); };
-  appendChunks((snapshot.programs || []).map(program => changes('program', program.id, program)));
   const cycles = snapshot.cycles || [];
+  const programs = snapshot.programs || [];
+  const programIds = new Set(programs.map(program => program.id));
+  const missingHistoricalPrograms = new Map();
+  for (const cycle of cycles) {
+    if (programIds.has(cycle.programId)) continue;
+    if (knownProgramIds.has(cycle.programId)) {
+      if (cycle.status === 'active' && knownDeletedProgramIds.has(cycle.programId)) {
+        throw new Error(`Le cycle actif référence un programme supprimé : ${cycle.programId}`);
+      }
+      continue;
+    }
+    if (cycle.status === 'active') throw new Error(`Le cycle actif référence un programme absent : ${cycle.programId}`);
+    const archivedProgram = cycle.programSnapshot;
+    if (!archivedProgram || archivedProgram.id !== cycle.programId || archivedProgram.profileId !== snapshot.profileId) {
+      throw new Error(`Le cycle historique ne contient pas de snapshot valide du programme : ${cycle.id}`);
+    }
+    missingHistoricalPrograms.set(cycle.programId, archivedProgram);
+  }
+  appendChunks([
+    ...programs.map(program => changes('program', program.id, program)),
+    ...[...missingHistoricalPrograms].map(([id, program]) => changes('program', id, program, true))
+  ]);
   appendChunks(cycles.filter(item => item.status !== 'active').map(cycle => changes('cycle', cycle.id, cycle)));
   const activeCycle = cycles.find(item => item.status === 'active');
   if (activeCycle) {
@@ -58,6 +79,7 @@ export function createSyncEngine({ supabase, repository, profileId, isOnline = (
   async function pullHistory() {
     let syncState = await repository.getSyncState();
     let cursor = String(syncState.cursor || '0');
+    let didApply = false;
     for (;;) {
       const page = await readResult(supabase.from('sync_record_history').select('change_id,profile_id,entity,record_id,version,payload,deleted_at,changed_at').eq('profile_id', profileId).gt('change_id', cursor).order('change_id', { ascending: true }).limit(PAGE_SIZE));
       if (!page?.length) break;
@@ -70,11 +92,12 @@ export function createSyncEngine({ supabase, repository, profileId, isOnline = (
       cursor = String(page.at(-1).change_id);
       const versions = [...latest.values()].map(row => [rowKey(row.entity, row.record_id), Number(row.version)]);
       await repository.applyRemoteRecords([...latest.values()], cursor, versions);
-      onRemoteApplied();
+      didApply = true;
       syncState = await repository.getSyncState();
       cursor = String(syncState.cursor || cursor);
       if (page.length < PAGE_SIZE) break;
     }
+    if (didApply) onRemoteApplied();
   }
 
   async function drainOutbox() {
@@ -123,7 +146,6 @@ export function createSyncEngine({ supabase, repository, profileId, isOnline = (
       catch (error) { if (error.code === 'SYNC_LOCAL_CHANGED') return initialSync(); throw error; }
       await pullHistory();
       await repository.markSyncInitialized((await repository.getSyncState()).cursor);
-      onRemoteApplied();
       return true;
     }
     initialDecision = { local, remote, highWater };
