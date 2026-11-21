@@ -64,6 +64,57 @@ test('saving a program stores its durable outbox operation in the same IndexedDB
   assert.deepEqual(outbox.changes[0], { entity: 'program', record_id: 'prog-a', deleted: false, payload: { ...program, createdAt: 100, updatedAt: 100 } });
 });
 
+test('built-in programs are inserted only when missing after initial sync and preserved on repeated startup', async () => {
+  const presetOne = { ...program, id: 'me-foundations-hypertrophy-v1', name: 'Fondations hypertrophie' };
+  const presetTwo = { ...program, id: 'me-hypertrophy-progression-v1', name: 'Progression hypertrophie' };
+  const customized = { ...presetOne, name: 'Mon programme personnalisé', revision: 7 };
+  const history = { id: 'finished-workout', profileId: 'me', cycleId: 'cycle-history', programId: presetOne.id, finished: 500, exercises: [] };
+  const db = new MemoryDatabase({ programs: [customized], sessions: [history], syncMeta: [{ id: 'initialized', value: true }] });
+  const repo = createRepository(db, 'me', { makeId: () => 'preset-op', now: () => 600 });
+  assert.deepEqual(await repo.ensureBuiltInPrograms([presetOne, presetTwo]), [presetTwo.id]);
+  assert.deepEqual(await repo.ensureBuiltInPrograms([presetOne, presetTwo]), []);
+  assert.equal(db.stores.get('programs').get(presetOne.id).name, customized.name);
+  assert.equal(db.stores.get('programs').get(presetTwo.id).name, presetTwo.name);
+  assert.equal(db.stores.get('sessions').get(history.id).id, history.id);
+  const operations = [...db.stores.get('outbox').values()];
+  assert.equal(operations.length, 1);
+  assert.equal(operations[0].opId, 'preset-op');
+  assert.deepEqual(operations[0].changes.map(change => change.record_id), [presetTwo.id]);
+  const tx = db.transactions.at(-2);
+  assert.ok(['programs', 'syncMeta', 'outbox'].every(name => tx.names.includes(name)));
+});
+
+test('built-in program seeding waits until the initial sync decision has initialized the profile', async () => {
+  const preset = { ...program, id: 'me-foundations-hypertrophy-v1' };
+  const db = new MemoryDatabase();
+  const repo = createRepository(db, 'me');
+  assert.deepEqual(await repo.ensureBuiltInPrograms([preset]), []);
+  assert.equal(db.stores.get('programs').size, 0);
+  assert.equal(db.stores.get('outbox').size, 0);
+});
+
+test('a workout started from a built-in session can record set values and finish into history', async () => {
+  const exercise = { id: 'bench-press-stable', name: 'Développé couché', sets: 1, repMin: 6, repMax: 8, rir: 2, restSeconds: 90 };
+  const workoutProgram = { ...program, sessions: program.sessions.map((session, index) => ({ ...session, exercises: index === 0 ? [exercise] : [] })) };
+  const db = new MemoryDatabase({ programs: [workoutProgram] });
+  let id = 0;
+  const repo = createRepository(db, 'me', { makeId: () => `record-${++id}`, now: () => 1234 });
+  const cycle = await repo.startCycle(workoutProgram.id);
+  const active = await repo.startSession('upper-a');
+  active.exercises[0].sets[0].kg = 40;
+  active.exercises[0].sets[0].reps = 8;
+  active.exercises[0].sets[0].done = true;
+  await repo.saveActiveSession(active);
+  const completed = await repo.finishSession();
+  assert.equal(completed.cycleId, cycle.id);
+  assert.equal(completed.exercises[0].id, exercise.id);
+  assert.deepEqual(completed.exercises[0].sets[0], { kg: 40, reps: 8, done: true });
+  assert.equal((await repo.listSessions()).length, 1);
+  assert.equal(await repo.getActiveSession(), null);
+  const finishOutbox = [...db.stores.get('outbox').values()].at(-1);
+  assert.deepEqual(finishOutbox.changes.map(change => change.entity), ['session', 'active_session']);
+});
+
 test('cycle activation queues cycle and profile state atomically', async () => {
   const db = new MemoryDatabase({ programs: [program] });
   const repo = createRepository(db, 'me', { makeId: () => 'cycle-a', now: () => 200 });

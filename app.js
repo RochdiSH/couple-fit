@@ -5,6 +5,7 @@ import { bindLocalDataOwner } from './auth-guard.js';
 import { createSupabaseClient } from './supabase-client.js';
 import { SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from './supabase-config.js';
 import { createSyncEngine } from './sync.js';
+import { BUILTIN_PROGRAMS } from './programs-v2.js';
 
 let profile = localStorage.getItem('forgefit-user') || null;
 let repository;
@@ -18,6 +19,7 @@ let authError = '';
 let accountLocked = false;
 let authUserEmail = '';
 let authGeneration = 0;
+let exerciseImageInventory = null;
 const today = new Date();
 let state = { page: 'home', programs: [], cycles: [], sessions: [], profileState: null, active: null, restUntil: 0,
   calendarYear: today.getFullYear(), calendarMonth: today.getMonth(), selectedDateKey: formatLocalDateKey(today.getTime()) };
@@ -91,7 +93,36 @@ function connectSync(dbRepository) {
     onRemoteApplied: () => { if (repository === dbRepository) void refresh(); }
   });
   dbRepository.setOnLocalMutation(() => { void syncEngine?.syncNow(); });
-  void syncEngine.syncNow();
+  void syncAndSeedBuiltIns(dbRepository, syncEngine);
+}
+
+async function seedBuiltInsAfterSync(dbRepository, engine, result) {
+  if (!dbRepository || !engine || repository !== dbRepository || ['needs-decision', 'conflict'].includes(result?.state)) return;
+  if (!(await dbRepository.getSyncState()).initialized) return;
+  const inserted = await dbRepository.ensureBuiltInPrograms(BUILTIN_PROGRAMS[dbRepository.profileId] || []);
+  if (inserted.length && repository === dbRepository) await refresh();
+}
+
+async function syncAndSeedBuiltIns(dbRepository = repository, engine = syncEngine) {
+  if (!engine) return;
+  const result = await engine.syncNow();
+  await seedBuiltInsAfterSync(dbRepository, engine, result);
+  return result;
+}
+
+function exercisePhotos(exercise) {
+  const entries = exerciseImageInventory?.profiles?.[profile]?.exercises || [];
+  const entry = entries.find(item => item.exerciseId === exercise.id && item.status === 'matched_downloaded');
+  const files = (entry?.files || []).filter(file => /^(me|wife)\/[a-z0-9-]+-[01]\.jpg$/.test(file)).slice(0, 2);
+  if (!files.length) return '<div class="exercise-photo-placeholder" role="img" aria-label="Photo non disponible">Photo non disponible</div>';
+  return `<div class="exercise-photos">${files.map((file, index) => `<img src="./images/exercises/${esc(file)}" alt="${esc(exercise.name)} — phase ${index + 1}" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'exercise-photo-placeholder',textContent:'Photo non disponible'}))">`).join('')}</div>`;
+}
+
+function exercisePrescription(exercise) {
+  const unit = exercise.repUnit === 'seconds' ? 's' : 'reps';
+  const qualifier = exercise.repQualifier ? ` ${esc(exercise.repQualifier)}` : '';
+  const rir = exercise.rirMax === undefined ? `${exercise.rir}` : `${exercise.rir}–${exercise.rirMax}`;
+  return `${exercise.sets} × ${exercise.repMin}–${exercise.repMax}${qualifier} ${unit} · RIR ${rir} · repos ${exercise.restSeconds}s`;
 }
 
 async function handleAuthSession(session) {
@@ -176,7 +207,7 @@ function programCard(program) {
   const status = programStatus(program, state.cycles, state.profileState?.activeCycleId);
   const statusLabels = { active: 'Cycle actif', used: 'Déjà utilisé', archived: 'Archivé', available: 'Disponible' };
   const actionLabel = status === 'available' ? 'Activer' : 'Réactiver';
-  const sessions = program.sessions.map(session => `<div class="exercise"><b>${esc(session.name)}</b><div class="hint">${session.exercises.length} exercices</div>${session.exercises.map(exercise => `<div class="hint">${esc(exercise.name)} · ${exercise.sets} × ${exercise.repMin}–${exercise.repMax} reps · RIR ${exercise.rir} · repos ${exercise.restSeconds}s</div>`).join('')}</div>`).join('');
+  const sessions = program.sessions.map(session => `<section class="program-session"><div class="row"><b>${esc(session.name)}</b><span class="hint">${session.exercises.length} exercices</span></div>${session.exercises.map(exercise => `<article class="program-exercise">${exercisePhotos(exercise)}<div><b>${esc(exercise.name)}</b><div class="hint">${exercisePrescription(exercise)}</div></div></article>`).join('')}</section>`).join('');
   const editableJson = esc(JSON.stringify(program, null, 2));
   return `<article class="card program-card"><div class="row"><div><h3>${esc(program.name)}</h3><div class="muted">${esc(program.description || 'Aucune description')}</div><div class="hint">${program.durationWeeks} semaines indicatives · révision ${program.revision}</div></div><span class="pill">${statusLabels[status]}</span></div><div class="row program-actions"><button class="primary" data-action="activate" data-id="${esc(program.id)}" ${state.profileState?.activeCycleId || state.active ? 'disabled' : ''}>${actionLabel}</button><details><summary>Voir les séances</summary>${sessions}</details></div><details class="program-editor"><summary>Modifier ce programme en JSON</summary><label class="hint" for="program-editor-${esc(program.id)}">Conserve l’identifiant du programme et les identifiants d’exercices pour préserver le suivi.</label><textarea class="program-json" id="program-editor-${esc(program.id)}" data-program-editor="${esc(program.id)}" spellcheck="false">${editableJson}</textarea><button class="secondary" data-action="save-program" data-id="${esc(program.id)}">Enregistrer les modifications</button></details></article>`;
 }
@@ -259,8 +290,8 @@ function workout() {
   const done = session.exercises.reduce((count, exercise) => count + exercise.sets.filter(set => set.done).length, 0);
   const total = session.exercises.reduce((count, exercise) => count + exercise.sets.length, 0);
   return header(esc(session.routineName), `Commencée à ${new Date(session.started).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}`) + `<main><div id="motivation-banner" class="motivation-banner" role="status" hidden></div><div class="card"><div class="row"><b>${done} / ${total} séries</b><div><div class="timer" id="timer">--:--</div><button class="smallbtn secondary" data-action="cancel-rest">Arrêter repos</button></div></div><div class="progressbar" style="margin-top:12px"><div style="width:${100 * done / Math.max(1, total)}%"></div></div></div>
-    ${session.exercises.map((exercise, ei) => `<div class="card"><div class="row"><div><b>${esc(exercise.name)}</b><div class="hint">${exercise.repMin}–${exercise.repMax} reps · RIR ${exercise.rir} · repos ${exercise.restSeconds}s</div></div><button class="secondary smallbtn" data-action="add-set" data-e="${ei}">+ série</button></div>
-    ${exercise.sets.map((set, si) => `<div class="set"><div class="pill">${si + 1}</div><label>kg<input type="number" min="0" max="1000" step="0.5" data-field="kg" data-e="${ei}" data-s="${si}" value="${esc(set.kg)}"></label><label>reps<input type="number" min="0" max="200" step="1" data-field="reps" data-e="${ei}" data-s="${si}" value="${esc(set.reps)}"></label><button class="${set.done ? 'done' : ''}" data-action="toggle-set" data-e="${ei}" data-s="${si}">${set.done ? '✓' : '○'}</button></div>`).join('')}
+    ${session.exercises.map((exercise, ei) => `<div class="card"><div class="row"><div><b>${esc(exercise.name)}</b><div class="hint">${exercisePrescription(exercise)}</div></div><button class="secondary smallbtn" data-action="add-set" data-e="${ei}">+ série</button></div>${exercisePhotos(exercise)}
+    ${exercise.sets.map((set, si) => `<div class="set"><div class="pill">${si + 1}</div><label>kg<input type="number" min="0" max="1000" step="0.5" data-field="kg" data-e="${ei}" data-s="${si}" value="${esc(set.kg)}"></label><label>${exercise.repUnit === 'seconds' ? 'secondes' : 'reps'}<input type="number" min="0" max="200" step="1" data-field="reps" data-e="${ei}" data-s="${si}" value="${esc(set.reps)}"></label><button class="${set.done ? 'done' : ''}" data-action="toggle-set" data-e="${ei}" data-s="${si}">${set.done ? '✓' : '○'}</button></div>`).join('')}
     <div class="hint">Dernière séance : ${exercise.sets.map((_, index) => { const previous = lastSet(exercise.id, exercise.name, index); return previous ? `${previous.kg} kg × ${previous.reps}` : null; }).filter(Boolean).join(' · ') || 'Pas encore d’historique'}</div></div>`).join('')}
     <button class="primary" style="width:100%;margin-top:10px" data-action="finish-session">Terminer et enregistrer</button><button class="danger" style="width:100%;margin-top:10px" data-action="discard-session">Abandonner la séance</button></main>`;
 }
@@ -359,15 +390,15 @@ document.addEventListener('click', async event => {
   if (!action) return;
   try {
     if (action === 'auth-signout') { await authService?.signOut(); clearSportMemory(); authSession = null; accountLocked = false; authStatus = 'signed-out'; authScreen(); return; }
-    if (action === 'sync-now') { await syncEngine?.syncNow(); return; }
+    if (action === 'sync-now') { await syncAndSeedBuiltIns(); return; }
     if (action === 'sync-upload') {
       if (!confirm('Envoyer les données locales actuelles vers ce compte Supabase ? Le cloud est vide pour ce profil.')) return;
-      await syncEngine?.chooseInitialSync('upload'); return;
+      const result = await syncEngine?.chooseInitialSync('upload'); await seedBuiltInsAfterSync(repository, syncEngine, result); return;
     }
-    if (action === 'sync-merge') { await syncEngine?.chooseInitialSync('merge'); return; }
+    if (action === 'sync-merge') { const result = await syncEngine?.chooseInitialSync('merge'); await seedBuiltInsAfterSync(repository, syncEngine, result); return; }
     if (action === 'sync-restore') {
       if (!confirm('Restaurer les données du cloud ? Cette action remplacera les données locales de ce profil après export conseillé.')) return;
-      await syncEngine?.chooseInitialSync('restore'); return;
+      const result = await syncEngine?.chooseInitialSync('restore'); await seedBuiltInsAfterSync(repository, syncEngine, result); return;
     }
     if (!repository) return;
     if (action === 'select-user') await selectUser(button.dataset.id);
@@ -462,13 +493,17 @@ document.addEventListener('change', async event => {
   if (input.id === 'voice-toggle') { localStorage.setItem('forgefit-voice', input.checked ? 'on' : 'off'); toast(input.checked ? 'Voix activée' : 'Voix désactivée'); }
 });
 
-window.addEventListener('online', () => { if (authStatus === 'signed-in') { render(); void syncEngine?.syncNow(); } });
+window.addEventListener('online', () => { if (authStatus === 'signed-in') { render(); void syncAndSeedBuiltIns(); } });
 window.addEventListener('offline', () => { if (authStatus === 'signed-in') { render(); void syncEngine?.syncNow(); } });
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && authStatus === 'signed-in') void syncEngine?.syncNow(); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && authStatus === 'signed-in') void syncAndSeedBuiltIns(); });
 
 (async () => {
   setInterval(updateTimer, 1000);
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
+  try {
+    const response = await fetch('./images/exercises/exercise-images.json');
+    if (response.ok) exerciseImageInventory = await response.json();
+  } catch { /* Les vues gardent un placeholder si l’inventaire n’est pas disponible. */ }
   try {
     supabaseClient = createSupabaseClient(window.supabase?.createClient, { url: SUPABASE_URL, publishableKey: SUPABASE_PUBLISHABLE_KEY });
     authService = createAuthService(supabaseClient);
