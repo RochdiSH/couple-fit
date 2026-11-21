@@ -1,36 +1,34 @@
-# ForgeFit V3 — Choix utilisateur à la première ouverture
+# ROCH&RANIA FIT
 
-Au premier lancement, choisir **Rochdi** ou **Rania**. Le choix est conservé dans le stockage local du téléphone et les ouvertures suivantes affichent directement le programme correspondant. Chaque profil utilise sa propre base IndexedDB. Dans Réglages, **Changer d’utilisateur** réaffiche le choix sans effacer les données.
+PWA locale de musculation, construite en HTML, CSS et JavaScript natifs. Les données sont stockées dans IndexedDB, séparément pour Rochdi et Rania. L'application fonctionne hors ligne après son premier chargement en ligne.
 
-Si vous installez la même PWA sur deux iPhone, le choix est indépendant sur chaque téléphone et il n’y a pas de synchronisation cloud. Les sauvegardes JSON sont propres à chaque profil.
+## Développement
 
-# ForgeFit V2 — Deux profils
+Les tests automatisés utilisent le runner intégré à Node.js, sans dépendances externes :
 
-Application PWA hors ligne, deux profils séparés sur le même iPhone : **Mon programme** et **Programme femme**.
+```sh
+npm test
+```
 
-## Installation
-Déployer les fichiers de `forgefit/` à la racine d’un hébergement HTTPS statique (par exemple GitHub Pages). Ouvrir dans Safari sur iPhone, Partager → Sur l’écran d’accueil. Les fichiers et illustrations sont mis en cache après la première ouverture en ligne.
+Servir les fichiers depuis une origine HTTPS (ou `localhost`) pour utiliser le service worker et IndexedDB.
 
-## Données
-Deux bases IndexedDB indépendantes sur le même navigateur/origine : `forgefit-db` et `forgefit-wife-db`. Changer de profil sur l’accueil. Export JSON par profil dans Réglages, à faire régulièrement. Le programme existant du profil principal est conservé lors d’une mise à jour V1 → V2. Pour remplacer une ancienne routine Lower B personnalisée, utiliser « Restaurer le programme initial » depuis Réglages du profil principal ; ceci réinitialise les quatre routines, mais conserve l’historique.
+## Modèle V2
 
-## Programmes
-- Profil principal : Upper A / Lower A / Upper B / Lower B, quatre séances productives, football le week-end : déplacer Lower B selon le match et la récupération.
-- Profil femme : Lower A fessiers / Upper A / Lower B fessiers / Upper B, avec travail complet du corps. Le niveau, la tolérance à l’effort et les disponibilités de la personne doivent être confirmés avant d’appliquer les charges et volumes.
-- RIR 2 typique ; charges initiales volontairement vides ; double progression : atteindre le haut de la fourchette sur toutes les séries au RIR visé puis augmenter la charge au plus petit incrément disponible.
-- Illustrations photographiques **indicatives** intégrées hors ligne, non démonstrations techniques exhaustives : plusieurs exercices partagent une image représentative de leur famille de mouvement.
+- `data.js` définit la validation des programmes, cycles, séances et sauvegardes, le dépôt IndexedDB et les règles d'activation.
+- L'écran « Mes programmes » permet d'importer un fichier JSON d'un seul programme ou de le modifier dans l'éditeur JSON. L'import d'un programme écrit uniquement cette entrée et conserve les cycles et l'historique ; réimporter le même identifiant met à jour sa révision.
+- Chaque profil possède une bibliothèque indépendante. Un programme a un identifiant stable, une révision, une durée indicative et les quatre séances `upper-a`, `lower-a`, `upper-b`, `lower-b`.
+- Un cycle conserve un snapshot du programme utilisé. Sa semaine indicative est calculée depuis la date de début. Terminer ou activer un cycle ne se fait jamais automatiquement et ces actions sont refusées pendant une séance active.
+- Les séances terminées référencent leur profil, programme, cycle et séance. Les exercices transportent un identifiant stable pour suivre les performances entre programmes.
+- L'onglet Calendrier construit ses jours terminés à partir de `sessions.finished` et du profil actif ; aucun store de calendrier n'est utilisé. Les clés de jour sont calculées en heure locale.
+- IndexedDB V3 conserve les stores existants, ajoute `outbox` et `syncMeta`, et ne supprime aucun store lors d'une mise à niveau. Chaque profil garde sa base locale (`forgefit-db` et `forgefit-wife-db`).
+- L'export JSON V2 contient programmes, cycles, historique, état du profil, séance active et minuteur. L'import V2 remplace les données du profil après confirmation. Les exports V1 ne sont pas pris en charge.
 
-## Limites
-Pas de Garmin Connect IQ, pas de synchronisation cloud ni entre deux téléphones. Le stockage local peut disparaître en cas d’effacement des données Safari ou de suppression de la PWA. Minuteur en arrière-plan iOS non garanti. Ne pas utiliser les images comme unique source d’apprentissage de la technique.
+Les programmes d'entraînement seront fournis ultérieurement en données structurées ; aucun contenu sportif n'est préchargé dans cette version. La synchronisation Supabase par enregistrement conserve IndexedDB comme source locale hors ligne.
 
-## Références scientifiques
-- Krause Neto et al. (2025), *The impact of resistance training on gluteus maximus hypertrophy*: https://pmc.ncbi.nlm.nih.gov/articles/PMC12018462/
-- Pelland et al. (2026), volume et fréquence : https://pubmed.ncbi.nlm.nih.gov/41343037/
-- Plotkin et al. (2023), hip thrust vs squat : https://pubmed.ncbi.nlm.nih.gov/37461495/
+## PWA
 
+Le service worker met en cache l'interface et ses modules JavaScript. Incrémenter le nom du cache lors des modifications de ressources afin que les appareils installés récupèrent la nouvelle version.
 
-## V4 — Motivation
-- Accueil Rania : « Rania va tout casser ! C’est une bête 🔥 ».
-- Après chaque série cochée, un encouragement apparaît (phrases différentes pour Rochdi et Rania).
-- Réglages : lecture vocale facultative, désactivée par défaut. Sur iOS, la synthèse vocale dépend du navigateur et de ses restrictions.
-- Les messages encouragent l'effort sans pousser à ignorer la douleur ou la technique.
+## Connexion et synchronisation Supabase
+
+La configuration Auth est décrite dans [docs/SUPABASE_AUTH.md](docs/SUPABASE_AUTH.md). Le contrat client, l'outbox, les choix de première synchronisation et les essais à deux appareils sont décrits dans [docs/SUPABASE_SYNC.md](docs/SUPABASE_SYNC.md).
