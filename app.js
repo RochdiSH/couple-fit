@@ -400,8 +400,12 @@ document.addEventListener('click', async event => {
       if (!confirm('Restaurer les données du cloud ? Cette action remplacera les données locales de ce profil après export conseillé.')) return;
       const result = await syncEngine?.chooseInitialSync('restore'); await seedBuiltInsAfterSync(repository, syncEngine, result); return;
     }
-    if (!repository) return;
-    if (action === 'select-user') await selectUser(button.dataset.id);
+      if (action === 'select-user') {
+          await selectUser(button.dataset.id);
+          return;
+      }
+
+      if (!repository) return;
     if (action === 'change-user') {
       if (state.active && !confirm('Une séance est en cours. Changer d’utilisateur sans la terminer ?')) return;
       localStorage.removeItem('forgefit-user'); clearSportMemory(); onboarding();
