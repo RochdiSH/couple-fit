@@ -1,7 +1,7 @@
-const CACHE = 'roch-rania-v3-programs';
+const CACHE = 'roch-rania-v4-session-ux';
 const ASSETS = [
   './', './index.html', './style.css', './app.js', './data.js', './calendar.js',
-  './programs-v2.js', './images/exercises/exercise-images.json',
+  './programs-v2.js', './progression.js', './rest-timer.js', './images/exercises/exercise-images.json',
   './auth.js', './auth-guard.js', './supabase-client.js', './supabase-config.js',
   './sync.js', './vendor/supabase-js-2.119.2.min.js', './images/exercises.webp',
   './manifest.webmanifest', './icons/icon-192.png', './icons/icon-512.png'

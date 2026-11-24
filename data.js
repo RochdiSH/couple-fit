@@ -149,6 +149,9 @@ export function validateProgram(program, expectedProfileId) {
       if (!Number.isInteger(exercise.restSeconds) || exercise.restSeconds < 0 || exercise.restSeconds > 3600) throw new Error('Temps de repos invalide');
       if (exercise.repUnit !== undefined && !['reps', 'seconds'].includes(exercise.repUnit)) throw new Error('Unité de répétition invalide');
       if (exercise.repQualifier !== undefined && typeof exercise.repQualifier !== 'string') throw new Error('Précision de répétition invalide');
+      if (exercise.loadModes !== undefined && (!Array.isArray(exercise.loadModes) || !exercise.loadModes.length || exercise.loadModes.some(mode => !['bodyweight', 'assisted', 'weighted'].includes(mode)) || new Set(exercise.loadModes).size !== exercise.loadModes.length)) throw new Error('Modes de charge invalides');
+      if (exercise.loadIncrementKg !== undefined && (!Number.isFinite(exercise.loadIncrementKg) || exercise.loadIncrementKg <= 0 || exercise.loadIncrementKg > 50)) throw new Error('Incrément de charge invalide');
+      if (exercise.repIncrement !== undefined && (!Number.isFinite(exercise.repIncrement) || exercise.repIncrement <= 0 || exercise.repIncrement > 60)) throw new Error('Incrément de répétition invalide');
     }
   }
   return program;
@@ -190,7 +193,12 @@ export function createTrainingSession(cycle, sessionId, startedAt = Date.now(), 
     routineName: template.name,
     started: startedAt,
     finished: null,
-    exercises: template.exercises.map(exercise => ({ ...structuredClone(exercise), sets: Array.from({ length: exercise.sets }, () => ({ kg: '', reps: exercise.repMin, done: false })) }))
+    exercises: template.exercises.map(exercise => {
+      const cloned = structuredClone(exercise);
+      cloned.prescribedSets = exercise.sets;
+      cloned.sets = Array.from({ length: exercise.sets }, () => ({ kg: '', reps: exercise.repMin, done: false }));
+      return cloned;
+    })
   };
 }
 
@@ -204,7 +212,8 @@ export function makeBackup(data, exportedAt = Date.now()) {
   if (!PROFILE_IDS.has(data.profileId)) throw new Error('Profil invalide');
   const backup = { app: 'ROCH&RANIA FIT', version: 2, exportedAt: new Date(exportedAt).toISOString(), profileId: data.profileId,
     programs: data.programs, cycles: data.cycles, sessions: data.sessions, profileState: data.profileState,
-    activeSession: data.activeSession || null, restUntil: data.restUntil || 0 };
+    activeSession: data.activeSession || null, restUntil: data.restUntil || 0,
+    restDurationSeconds: data.restDurationSeconds || 0 };
   return validateBackup(backup, data.profileId);
 }
 
@@ -289,7 +298,7 @@ export function createRepository(db, profileId, { now = Date.now, makeId = () =>
     const [programs, cycles, sessions, profileState, activeSession, restUntil] = await Promise.all([
       readAll('programs'), readAll('cycles'), readAll('sessions'), read('profileState', profileId), read('meta', 'activeSession'), read('meta', 'rest')
     ]);
-    return { profileId, programs, cycles, sessions, profileState: profileState || { profileId, activeCycleId: null }, activeSession: activeSession?.data || null, restUntil: restUntil?.until || 0 };
+    return { profileId, programs, cycles, sessions, profileState: profileState || { profileId, activeCycleId: null }, activeSession: activeSession?.data || null, restUntil: restUntil?.until || 0, restDurationSeconds: restUntil?.durationSeconds || 0 };
   };
   const applyRemoteRow = (tx, row, versions) => {
     if (row.profile_id !== profileId) throw new Error('Enregistrement distant lié à un autre profil');
@@ -330,6 +339,10 @@ export function createRepository(db, profileId, { now = Date.now, makeId = () =>
     getProfileState: async () => (await read('profileState', profileId)) || { profileId, activeCycleId: null, updatedAt: now() },
     getActiveSession: async () => (await read('meta', 'activeSession'))?.data || null,
     getRestUntil: async () => (await read('meta', 'rest'))?.until || 0,
+    getRestTimer: async () => {
+      const rest = await read('meta', 'rest');
+      return { until: rest?.until || 0, durationSeconds: rest?.durationSeconds || 0 };
+    },
     ensureBuiltInPrograms: async catalog => {
       if (!Array.isArray(catalog)) throw new Error('Catalogue de programmes invalide');
       const catalogIds = new Set();
@@ -373,7 +386,7 @@ export function createRepository(db, profileId, { now = Date.now, makeId = () =>
       queueOutbox(tx, [changeRecord('active_session', 'current', value)]);
       await transactionDone(tx); signalMutation();
     },
-    saveRestUntil: until => write('meta', { id: 'rest', until }),
+    saveRestUntil: (until, durationSeconds = 0) => write('meta', { id: 'rest', until, durationSeconds }),
     clearRest: () => remove('meta', 'rest'),
     startCycle: async programId => {
       const tx = db.transaction(['programs', 'cycles', 'profileState', 'meta', 'outbox'], 'readwrite');
@@ -765,7 +778,7 @@ export function createRepository(db, profileId, { now = Date.now, makeId = () =>
           if (loaded !== requests.length) return;
           [programs, cycles, sessions, profileState, active, rest, queued, syncValues] = requests.map(request => request.result);
           if (queued.length) return fail(new Error('Import refusé : synchronise ou résous d’abord les opérations locales en attente.'));
-          const before = { profileId, programs, cycles, sessions, profileState: profileState || { profileId, activeCycleId: null }, activeSession: active?.data || null, restUntil: rest?.until || 0 };
+          const before = { profileId, programs, cycles, sessions, profileState: profileState || { profileId, activeCycleId: null }, activeSession: active?.data || null, restUntil: rest?.until || 0, restDurationSeconds: rest?.durationSeconds || 0 };
           for (const name of BACKUP_STORE_NAMES) tx.objectStore(name).clear();
           for (const program of backup.programs) tx.objectStore('programs').put(program);
           for (const cycle of backup.cycles) tx.objectStore('cycles').put(cycle);
@@ -773,7 +786,7 @@ export function createRepository(db, profileId, { now = Date.now, makeId = () =>
           tx.objectStore('profileState').put(backup.profileState || { profileId, activeCycleId: null, updatedAt: now() });
           tx.objectStore('meta').delete('activeSession'); tx.objectStore('meta').delete('rest');
           if (backup.activeSession) tx.objectStore('meta').put({ id: 'activeSession', data: backup.activeSession });
-          if (backup.restUntil) tx.objectStore('meta').put({ id: 'rest', until: backup.restUntil });
+          if (backup.restUntil) tx.objectStore('meta').put({ id: 'rest', until: backup.restUntil, durationSeconds: backup.restDurationSeconds || 0 });
           // Before first pairing, the user must still choose the bootstrap action.
           // After pairing, represent the import as durable ordered RPC operations.
           if (syncValues.some(item => item.id === 'initialized' && item.value === true)) {

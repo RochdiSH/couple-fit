@@ -103,16 +103,34 @@ test('a workout started from a built-in session can record set values and finish
   const active = await repo.startSession('upper-a');
   active.exercises[0].sets[0].kg = 40;
   active.exercises[0].sets[0].reps = 8;
+  active.exercises[0].sets[0].rir = 2;
+  active.exercises[0].sets[0].techniqueOk = true;
   active.exercises[0].sets[0].done = true;
   await repo.saveActiveSession(active);
   const completed = await repo.finishSession();
   assert.equal(completed.cycleId, cycle.id);
   assert.equal(completed.exercises[0].id, exercise.id);
-  assert.deepEqual(completed.exercises[0].sets[0], { kg: 40, reps: 8, done: true });
+  assert.deepEqual(completed.exercises[0].sets[0], { kg: 40, reps: 8, rir: 2, techniqueOk: true, done: true });
   assert.equal((await repo.listSessions()).length, 1);
   assert.equal(await repo.getActiveSession(), null);
   const finishOutbox = [...db.stores.get('outbox').values()].at(-1);
   assert.deepEqual(finishOutbox.changes.map(change => change.entity), ['session', 'active_session']);
+});
+
+test('mode-specific set data, RIR, and rest deadline survive JSON backup and local restoration', async () => {
+  const active = { id: 'active-pullup', profileId: 'me', programId: 'prog-a', cycleId: 'cycle-a', sessionId: 'upper-a', started: 100, finished: null,
+    exercises: [{ id: 'pullup-pronated', name: 'Tractions', repUnit: 'reps', prescribedSets: 1,
+      sets: [{ kg: 2.5, reps: 8, loadMode: 'weighted', rir: 2, techniqueOk: true, done: false }] }] };
+  const source = new MemoryDatabase({ meta: [{ id: 'activeSession', data: active }, { id: 'rest', until: 5000, durationSeconds: 90 }] });
+  const sourceRepo = createRepository(source, 'me');
+  const backup = await sourceRepo.snapshot();
+  assert.deepEqual(backup.activeSession, active);
+  assert.equal(backup.restDurationSeconds, 90);
+  const destination = new MemoryDatabase();
+  const destinationRepo = createRepository(destination, 'me');
+  await destinationRepo.importBackup(backup);
+  assert.deepEqual(await destinationRepo.getActiveSession(), active);
+  assert.deepEqual(await destinationRepo.getRestTimer(), { until: 5000, durationSeconds: 90 });
 });
 
 test('cycle activation queues cycle and profile state atomically', async () => {

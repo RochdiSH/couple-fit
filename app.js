@@ -6,6 +6,8 @@ import { createSupabaseClient } from './supabase-client.js';
 import { SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from './supabase-config.js';
 import { createSyncEngine } from './sync.js';
 import { BUILTIN_PROGRAMS } from './programs-v2.js';
+import { latestCompletedSessionForCycle, nextSessionSuggestion, recommendExercise, trainingVolume } from './progression.js';
+import { formatRemainingSeconds, remainingRestSeconds, restProgress } from './rest-timer.js';
 
 let profile = localStorage.getItem('forgefit-user') || null;
 let repository;
@@ -21,9 +23,10 @@ let authUserEmail = '';
 let authGeneration = 0;
 let exerciseImageInventory = null;
 const today = new Date();
-let state = { page: 'home', programs: [], cycles: [], sessions: [], profileState: null, active: null, restUntil: 0,
+let state = { page: 'home', programs: [], cycles: [], sessions: [], profileState: null, active: null, restUntil: 0, restDurationSeconds: 0,
   calendarYear: today.getFullYear(), calendarMonth: today.getMonth(), selectedDateKey: formatLocalDateKey(today.getTime()) };
 let motivationIndex = 0;
+let restTicker = null;
 const el = document.getElementById('app');
 const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 const uid = () => crypto.randomUUID();
@@ -57,10 +60,11 @@ function authScreen() {
 }
 
 function clearSportMemory() {
+  stopRestTicker();
   repository?.close(); repository = null; profile = null;
   syncEngine = null; syncStatus = null;
   const panel = document.getElementById('sync-panel'); if (panel) { panel.hidden = true; panel.innerHTML = ''; }
-  state = { ...state, programs: [], cycles: [], sessions: [], profileState: null, active: null, restUntil: 0 };
+  state = { ...state, programs: [], cycles: [], sessions: [], profileState: null, active: null, restUntil: 0, restDurationSeconds: 0 };
 }
 
 function updateSyncPanel(status = syncEngine?.getStatus()) {
@@ -122,7 +126,9 @@ function exercisePrescription(exercise) {
   const unit = exercise.repUnit === 'seconds' ? 's' : 'reps';
   const qualifier = exercise.repQualifier ? ` ${esc(exercise.repQualifier)}` : '';
   const rir = exercise.rirMax === undefined ? `${exercise.rir}` : `${exercise.rir}–${exercise.rirMax}`;
-  return `${exercise.sets} × ${exercise.repMin}–${exercise.repMax}${qualifier} ${unit} · RIR ${rir} · repos ${exercise.restSeconds}s`;
+  const prescribedSets = Number.isInteger(exercise.prescribedSets) ? exercise.prescribedSets
+    : Number.isInteger(exercise.sets) ? exercise.sets : Array.isArray(exercise.sets) ? exercise.sets.length : 0;
+  return `${prescribedSets} séries × ${exercise.repMin}–${exercise.repMax}${qualifier} ${unit} · RIR ${rir} · repos ${exercise.restSeconds} s`;
 }
 
 async function handleAuthSession(session) {
@@ -176,10 +182,12 @@ async function selectUser(target) {
 }
 
 async function refresh() {
-  [state.programs, state.cycles, state.sessions, state.profileState, state.active, state.restUntil] = await Promise.all([
+  const [programs, cycles, sessions, profileState, active, restTimer] = await Promise.all([
     repository.listPrograms(), repository.listCycles(), repository.listSessions(), repository.getProfileState(),
-    repository.getActiveSession(), repository.getRestUntil()
+    repository.getActiveSession(), repository.getRestTimer()
   ]);
+  [state.programs, state.cycles, state.sessions, state.profileState, state.active] = [programs, cycles, sessions, profileState, active];
+  state.restUntil = restTimer.until; state.restDurationSeconds = restTimer.durationSeconds || remainingRestSeconds(restTimer.until);
   render();
 }
 
@@ -199,8 +207,13 @@ function render() {
   if (!repository || authStatus !== 'signed-in') { authScreen(); return; }
   nav();
   const pages = { home, programs, calendar, workout, progress, settings };
-  el.innerHTML = connectionBadge() + (pages[state.page] || home)();
+  el.innerHTML = connectionBadge() + (pages[state.page] || home)() + (state.active ? restFloating() : '');
   updateTimer();
+}
+
+function restFloating() {
+  const restActive = remainingRestSeconds(state.restUntil) > 0;
+  return `<aside id="rest-floating" class="rest-floating" ${restActive ? '' : 'hidden'} role="timer" aria-live="polite"><div class="rest-actions"><strong>Repos</strong><strong id="rest-time" class="timer">--:--</strong><button class="smallbtn secondary" data-action="extend-rest">+30 s</button><button class="smallbtn primary" data-action="finish-rest">Terminer</button></div><div class="progressbar rest-progress"><div id="rest-progress-fill"></div></div></aside>`;
 }
 
 function programCard(program) {
@@ -227,8 +240,15 @@ function home() {
 
 function programs() {
   const cycle = activeCycle();
+  const latest = cycle && latestCompletedSessionForCycle(cycle, state.sessions);
+  const nextId = cycle && nextSessionSuggestion(cycle, state.sessions);
   return header('Mes programmes', 'Bibliothèque personnelle · programmes modifiables en JSON') + `<main>
-    ${cycle ? `<section class="card"><div class="eyebrow">Cycle actif</div><h2>${esc(cycle.programSnapshot.name)}</h2><div class="hint">Semaine ${currentCycleWeek(cycle)} · durée cible ${cycle.targetWeeks} semaines · commencé le ${new Date(cycle.startedAt).toLocaleDateString('fr-FR')}</div><div class="row program-actions"><button class="secondary" data-action="extend-cycle" ${state.active ? 'disabled' : ''}>Prolonger d’une semaine</button><button class="danger" data-action="end-cycle" ${state.active ? 'disabled' : ''}>Terminer le cycle</button></div>${state.active ? '<div class="hint">Termine ou abandonne la séance en cours avant de modifier le cycle.</div>' : ''}<h3 style="margin-top:16px">Séances du cycle</h3>${cycle.programSnapshot.sessions.map(session => `<div class="row exercise"><div><b>${esc(session.name)}</b><div class="hint">${session.exercises.length} exercices</div></div><button class="primary" data-action="start-session" data-id="${esc(session.id)}" ${state.active ? 'disabled' : ''}>Démarrer</button></div>`).join('')}</section>` : `<section class="card"><h2>Aucun cycle actif</h2><p class="muted">Active un programme disponible. Pour passer à un autre programme, termine d’abord le cycle actif.</p>${state.active ? '<div class="hint">Les actions de cycle sont bloquées pendant une séance.</div>' : ''}</section>`}
+    ${cycle ? `<section class="card"><div class="eyebrow">Cycle actif</div><h2>${esc(cycle.programSnapshot.name)}</h2><div class="hint">Semaine ${currentCycleWeek(cycle)} · durée cible ${cycle.targetWeeks} semaines · commencé le ${new Date(cycle.startedAt).toLocaleDateString('fr-FR')}</div><div class="row program-actions"><button class="secondary" data-action="extend-cycle" ${state.active ? 'disabled' : ''}>Prolonger d’une semaine</button><button class="danger" data-action="end-cycle" ${state.active ? 'disabled' : ''}>Terminer le cycle</button></div>${state.active ? '<div class="hint">Termine ou abandonne la séance en cours avant de modifier le cycle.</div>' : ''}<h3 style="margin-top:16px">Séances du cycle</h3>${cycle.programSnapshot.sessions.map(session => {
+      const isLatest = latest?.sessionId === session.id;
+      const isNext = !latest ? nextId === session.id : nextId === session.id && !isLatest;
+      const status = isLatest ? `<div class="hint session-status completed">✓ Dernière séance effectuée · ${new Date(latest.finished).toLocaleDateString('fr-FR')}</div>` : isNext ? '<div class="hint session-status suggested">→ Prochaine séance suggérée</div>' : '';
+      return `<div class="row exercise"><div><b>${esc(session.name)}</b><div class="hint">${session.exercises.length} exercices</div>${status}</div><button class="${isNext ? 'primary' : 'secondary'}" data-action="start-session" data-id="${esc(session.id)}" ${state.active ? 'disabled' : ''}>Démarrer</button></div>`;
+    }).join('')}</section>` : `<section class="card"><h2>Aucun cycle actif</h2><p class="muted">Active un programme disponible. Pour passer à un autre programme, termine d’abord le cycle actif.</p>${state.active ? '<div class="hint">Les actions de cycle sont bloquées pendant une séance.</div>' : ''}</section>`}
     <div class="row"><h2>Bibliothèque</h2><span class="pill">${state.programs.length} programme(s)</span></div>
     ${state.programs.length ? state.programs.map(program => programCard(program)).join('') : '<div class="empty card">Aucun programme pour ce profil. Importe un fichier programme JSON pour remplir ta bibliothèque ; l’historique ne sera pas remplacé.</div>'}
     <section class="card"><h3>Ajouter ou importer un programme</h3><p class="muted">Choisis un fichier JSON contenant un seul programme, ou colle son contenu ci-dessous. Réimporter un identifiant existant met à jour le programme sans modifier ses anciens cycles ni l’historique.</p><label class="button program-file-label">Importer un programme JSON<input type="file" id="program-file" accept="application/json,.json" hidden></label><label class="hint" for="new-program-json">JSON du programme</label><textarea class="program-json" id="new-program-json" spellcheck="false" placeholder="Colle ici un objet programme V2"></textarea><button class="primary" data-action="save-new-program">Enregistrer le programme</button></section>
@@ -249,7 +269,7 @@ function calendar() {
   const selectedSessions = selectedDate?.sessions || [];
   const details = selectedSessions.length ? selectedSessions.map(session => `<article class="card calendar-session"><div class="row"><div><h3>${esc(session.routineName || session.sessionName || 'Séance')}</h3><div class="hint">${esc(session.programName || 'Programme')} · terminée à ${new Date(session.finished).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}</div></div></div>${(session.exercises || []).map(exercise => {
     const completedSets = (exercise.sets || []).map((set, index) => ({ set, index })).filter(item => item.set.done);
-    return `<div class="calendar-exercise"><b>${esc(exercise.name)}</b>${completedSets.length ? completedSets.map(({ set, index }) => `<div class="hint">Série ${index + 1} · ${esc(set.kg === '' || set.kg == null ? '—' : set.kg)} kg × ${esc(set.reps)} reps</div>`).join('') : '<div class="hint">Aucune série validée</div>'}</div>`;
+    return `<div class="calendar-exercise"><b>${esc(exercise.name)}</b>${completedSets.length ? completedSets.map(({ set, index }) => `<div class="hint">Série ${index + 1} · ${esc(formatSetResult(exercise, set))}</div>`).join('') : '<div class="hint">Aucune série validée</div>'}</div>`;
   }).join('')}</article>`).join('') : '<div class="empty card">Aucune séance terminée à cette date.</div>';
   const selectedDateTitle = state.selectedDateKey ? (() => {
     const [year, monthNumber, day] = state.selectedDateKey.split('-').map(Number);
@@ -271,17 +291,63 @@ function lastSet(exerciseId, exerciseName, index) {
   return null;
 }
 
+function isPullUp(exercise) { return /^(pullup|assisted-pullup)(-|$)/.test(exercise?.id || ''); }
+function exerciseLoadModes(exercise) { return isPullUp(exercise) ? ['bodyweight', 'assisted', 'weighted'] : (exercise.loadModes || []); }
+
 async function startSession(sessionId) {
   if (state.active) return toast('Termine ou abandonne la séance en cours avant d’en démarrer une autre.');
   const session = await repository.startSession(sessionId);
-  const cycle = activeCycle();
-  for (const exercise of session.exercises) exercise.sets.forEach((set, index) => {
-    const previous = lastSet(exercise.id, exercise.name, index);
-    if (previous) { set.kg = previous.kg; set.reps = previous.reps; }
-  });
+  for (const exercise of session.exercises) {
+    const modeBased = isPullUp(exercise) || exerciseLoadModes(exercise).length > 0;
+    const modeHistory = modeBased ? state.sessions.find(item => item.finished && item.exercises?.some(previous => previous.id === exercise.id
+      && previous.sets?.some(set => set.done && ['bodyweight', 'assisted', 'weighted'].includes(set.loadMode)))) : null;
+    const previousExercise = modeHistory?.exercises.find(previous => previous.id === exercise.id);
+    const hasModeHistory = Boolean(previousExercise?.sets.some(set => set.done && ['bodyweight', 'assisted', 'weighted'].includes(set.loadMode)));
+    if (hasModeHistory) exercise.sets.forEach((set, index) => {
+      const previousMode = previousExercise.sets[index]?.loadMode;
+      if (['bodyweight', 'assisted', 'weighted'].includes(previousMode)) set.loadMode = previousMode;
+    });
+    const recommendation = recommendExercise({ exercise, history: state.sessions, loadMode: modeBased && hasModeHistory ? 'auto' : null });
+    exercise.progressionRecommendation = { reason: recommendation.reason, previous: recommendation.previous, sets: recommendation.sets };
+    exercise.sets.forEach((set, index) => {
+      const suggestion = recommendation.sets.find(item => item.index === index);
+      if (suggestion) {
+        if (suggestion.kg !== undefined) set.kg = suggestion.kg;
+        set.reps = suggestion.reps;
+        if (suggestion.loadMode) set.loadMode = suggestion.loadMode;
+      } else if (!modeBased) {
+        const previous = lastSet(exercise.id, exercise.name, index);
+        if (previous) { set.kg = previous.kg; set.reps = previous.reps; }
+      }
+    });
+  }
   await repository.saveActiveSession(session);
   state.active = session;
   page('workout');
+}
+
+function setLoadLabel(mode) {
+  return mode === 'assisted' ? 'Assistance (kg)' : mode === 'weighted' ? 'Lest (kg)' : 'Charge (kg)';
+}
+
+function renderSet(exercise, exerciseIndex, set, setIndex) {
+  const modes = exerciseLoadModes(exercise);
+  const mode = set.loadMode || '';
+  const kgLabel = modes.length ? setLoadLabel(mode) : 'kg';
+  const loadControl = modes.length && mode === 'bodyweight'
+    ? '<span class="bodyweight-load">Poids du corps</span>'
+    : `<label>${kgLabel}<input type="number" min="0" max="1000" step="0.5" data-field="kg" data-e="${exerciseIndex}" data-s="${setIndex}" value="${esc(set.kg)}"></label>`;
+  const modeControl = modes.length ? `<label class="load-mode-label">Mode<select data-field="loadMode" data-e="${exerciseIndex}" data-s="${setIndex}"><option value="" ${!mode ? 'selected' : ''}>À choisir</option>${modes.map(value => `<option value="${value}" ${mode === value ? 'selected' : ''}>${value === 'bodyweight' ? 'Poids du corps' : value === 'assisted' ? 'Assistées' : 'Lestées'}</option>`).join('')}</select></label>` : '';
+  return `${modeControl}<div class="set"><div class="pill">${setIndex + 1}</div>${loadControl}<label>${exercise.repUnit === 'seconds' ? 'secondes' : 'reps'}<input type="number" min="0" max="200" step="1" data-field="reps" data-e="${exerciseIndex}" data-s="${setIndex}" value="${esc(set.reps)}"></label><label>RIR<input type="number" min="0" max="10" step="1" data-field="rir" data-e="${exerciseIndex}" data-s="${setIndex}" value="${esc(set.rir ?? '')}" placeholder="—"></label><button class="${set.done ? 'done' : ''}" data-action="toggle-set" data-e="${exerciseIndex}" data-s="${setIndex}" aria-label="${set.done ? 'Annuler série' : 'Valider série'}">${set.done ? '✓' : '○'}</button></div><label class="technique-toggle"><input type="checkbox" data-field="techniqueOk" data-e="${exerciseIndex}" data-s="${setIndex}" ${set.techniqueOk ? 'checked' : ''}> Technique maîtrisée</label>`;
+}
+
+function recommendationSummary(exercise) {
+  const recommendation = exercise.progressionRecommendation;
+  if (!recommendation) return '';
+  const format = set => `${set.kg == null ? '' : `${set.loadMode === 'assisted' ? 'assistance ' : set.loadMode === 'weighted' ? '+' : ''}${set.kg} kg × `}${set.reps}${exercise.repUnit === 'seconds' ? ' s' : ' reps'}`;
+  const suggestions = (recommendation.sets || []).map(set => `S${set.index + 1} ${format(set)}`).join(' · ');
+  const previous = (recommendation.previous || []).map(set => `S${set.index + 1} ${format(set)}`).join(' · ');
+  return `<div class="progression-note"><strong>${suggestions ? `Suggestion : ${suggestions}` : 'Pas encore de performance comparable'}</strong>${previous ? `<div>Dernière séance : ${previous}</div>` : ''}<div>${esc(recommendation.reason)}</div></div>`;
 }
 
 function workout() {
@@ -289,23 +355,22 @@ function workout() {
   if (!session) return header('Séance', 'Aucune séance en cours') + '<main><div class="empty">Choisis une séance depuis le programme actif.</div></main>';
   const done = session.exercises.reduce((count, exercise) => count + exercise.sets.filter(set => set.done).length, 0);
   const total = session.exercises.reduce((count, exercise) => count + exercise.sets.length, 0);
-  return header(esc(session.routineName), `Commencée à ${new Date(session.started).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}`) + `<main><div id="motivation-banner" class="motivation-banner" role="status" hidden></div><div class="card"><div class="row"><b>${done} / ${total} séries</b><div><div class="timer" id="timer">--:--</div><button class="smallbtn secondary" data-action="cancel-rest">Arrêter repos</button></div></div><div class="progressbar" style="margin-top:12px"><div style="width:${100 * done / Math.max(1, total)}%"></div></div></div>
+  return header(esc(session.routineName), `Commencée à ${new Date(session.started).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}`) + `<main><div id="motivation-banner" class="motivation-banner" role="status" hidden></div><div class="card"><div class="row"><b>${done} / ${total} séries</b></div><div class="progressbar" style="margin-top:12px"><div style="width:${100 * done / Math.max(1, total)}%"></div></div></div>
     ${session.exercises.map((exercise, ei) => `<div class="card"><div class="row"><div><b>${esc(exercise.name)}</b><div class="hint">${exercisePrescription(exercise)}</div></div><button class="secondary smallbtn" data-action="add-set" data-e="${ei}">+ série</button></div>${exercisePhotos(exercise)}
-    ${exercise.sets.map((set, si) => `<div class="set"><div class="pill">${si + 1}</div><label>kg<input type="number" min="0" max="1000" step="0.5" data-field="kg" data-e="${ei}" data-s="${si}" value="${esc(set.kg)}"></label><label>${exercise.repUnit === 'seconds' ? 'secondes' : 'reps'}<input type="number" min="0" max="200" step="1" data-field="reps" data-e="${ei}" data-s="${si}" value="${esc(set.reps)}"></label><button class="${set.done ? 'done' : ''}" data-action="toggle-set" data-e="${ei}" data-s="${si}">${set.done ? '✓' : '○'}</button></div>`).join('')}
-    <div class="hint">Dernière séance : ${exercise.sets.map((_, index) => { const previous = lastSet(exercise.id, exercise.name, index); return previous ? `${previous.kg} kg × ${previous.reps}` : null; }).filter(Boolean).join(' · ') || 'Pas encore d’historique'}</div></div>`).join('')}
+    ${exercise.sets.map((set, si) => renderSet(exercise, ei, set, si)).join('')}${recommendationSummary(exercise)}</div>`).join('')}
     <button class="primary" style="width:100%;margin-top:10px" data-action="finish-session">Terminer et enregistrer</button><button class="danger" style="width:100%;margin-top:10px" data-action="discard-session">Abandonner la séance</button></main>`;
 }
 
 function progress() {
   const finished = state.sessions.filter(session => session.finished);
-  const volume = finished.reduce((sum, session) => sum + session.exercises.reduce((subtotal, exercise) => subtotal + exercise.sets.reduce((value, set) => value + (set.done ? Number(set.kg || 0) * Number(set.reps || 0) : 0), 0), 0), 0);
+  const volume = trainingVolume(finished);
   const exercises = new Map();
   for (const session of finished) for (const exercise of session.exercises) {
     const key = exercise.id || `legacy:${exercise.name}`;
     if (!exercises.has(key)) exercises.set(key, exercise.name);
   }
   const options = [...exercises].sort((a, b) => a[1].localeCompare(b[1], 'fr'));
-  return header('Progression', 'Performances et historique de tes séances') + `<main><div class="grid2"><div class="card"><div class="stats">${finished.length}</div><small>Séances terminées</small></div><div class="card"><div class="stats">${Math.round(volume).toLocaleString('fr-FR')}</div><small>kg de volume cumulé</small></div></div><div class="card"><h3>Évolution par exercice</h3><select id="exercise-select"><option value="">Choisir un exercice</option>${options.map(([id, name]) => `<option value="${esc(id)}">${esc(name)}</option>`).join('')}</select><div id="exercise-chart" class="hint" style="margin-top:15px">Sélectionne un exercice pour voir tes charges.</div></div><h2>Historique</h2>${finished.length ? finished.map(session => `<div class="card"><div class="row"><div><b>${esc(session.programName)} · ${esc(session.routineName)}</b><div class="hint">${new Date(session.finished).toLocaleDateString('fr-FR')} · ${session.exercises.reduce((count, exercise) => count + exercise.sets.filter(set => set.done).length, 0)} séries</div></div><button class="smallbtn secondary" data-action="detail" data-id="${esc(session.id)}">Détails</button></div></div>`).join('') : '<div class="empty">Termine une première séance pour voir ta progression.</div>'}</main>`;
+  return header('Progression', 'Performances et historique de tes séances') + `<main><div class="grid2"><div class="card"><div class="stats">${finished.length}</div><small>Séances terminées</small></div><div class="card"><div class="stats">${Math.round(volume.externalLoadKg).toLocaleString('fr-FR')}</div><small>kg·reps · charges externes</small></div><div class="card"><div class="stats">${volume.bodyweightReps}</div><small>reps au poids du corps</small></div><div class="card"><div class="stats">${volume.assistedReps}</div><small>reps assistées</small></div><div class="card"><div class="stats">${Math.round(volume.weightedPullupKg).toLocaleString('fr-FR')}</div><small>kg·reps · lest tractions</small></div><div class="card"><div class="stats">${volume.timedSeconds}</div><small>secondes chronométrées</small></div></div>${volume.ambiguousLegacySets ? `<p class="hint">${volume.ambiguousLegacySets} ancienne(s) série(s) de tractions sans mode enregistré sont conservées dans l’historique, mais exclues du volume.</p>` : ''}<div class="card"><h3>Évolution par exercice</h3><select id="exercise-select"><option value="">Choisir un exercice</option>${options.map(([id, name]) => `<option value="${esc(id)}">${esc(name)}</option>`).join('')}</select><div id="exercise-chart" class="hint" style="margin-top:15px">Sélectionne un exercice pour voir tes charges.</div></div><h2>Historique</h2>${finished.length ? finished.map(session => `<div class="card"><div class="row"><div><b>${esc(session.programName)} · ${esc(session.routineName)}</b><div class="hint">${new Date(session.finished).toLocaleDateString('fr-FR')} · ${session.exercises.reduce((count, exercise) => count + exercise.sets.filter(set => set.done).length, 0)} séries</div></div><button class="smallbtn secondary" data-action="detail" data-id="${esc(session.id)}">Détails</button></div></div>`).join('') : '<div class="empty">Termine une première séance pour voir ta progression.</div>'}</main>`;
 }
 
 function drawChart(name) {
@@ -313,10 +378,11 @@ function drawChart(name) {
   if (!out) return;
   const points = state.sessions.filter(session => session.finished).slice().reverse().map(session => {
     const exercise = session.exercises.find(item => item.id === name) || session.exercises.find(item => !item.id && `legacy:${item.name}` === name);
-    const weights = exercise?.sets.filter(set => set.done && Number(set.kg) > 0).map(set => Number(set.kg)) || [];
+    const isPullUpExercise = isPullUp(exercise || { id: name });
+    const weights = exercise?.sets.filter(set => set.done && Number(set.kg) > 0 && (!isPullUpExercise || set.loadMode === 'weighted')).map(set => Number(set.kg)) || [];
     return weights.length ? { date: new Date(session.finished).toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit' }), kg: Math.max(...weights) } : null;
   }).filter(Boolean);
-  if (!points.length) { out.textContent = 'Aucune série avec charge pour cet exercice.'; return; }
+  if (!points.length) { out.textContent = 'Aucune série comparable avec charge externe définie pour cet exercice.'; return; }
   const min = Math.min(...points.map(point => point.kg)), max = Math.max(...points.map(point => point.kg)), span = Math.max(max - min, 1);
   const x = index => 20 + index * 300 / Math.max(1, points.length - 1), y = point => 145 - (point.kg - min) / span * 115;
   const coords = points.map((point, index) => `${x(index)},${y(point)}`).join(' ');
@@ -340,13 +406,23 @@ function encourage() {
   }
 }
 
+function stopRestTicker() {
+  if (restTicker) clearInterval(restTicker);
+  restTicker = null;
+}
+
 function updateTimer() {
-  const timer = document.getElementById('timer');
-  if (!timer) return;
-  const remaining = Math.max(0, Math.ceil((state.restUntil - Date.now()) / 1000));
-  timer.textContent = `${String(Math.floor(remaining / 60)).padStart(2, '0')}:${String(remaining % 60).padStart(2, '0')}`;
+  const remaining = remainingRestSeconds(state.restUntil);
+  const banner = document.getElementById('rest-floating');
+  const timer = document.getElementById('rest-time');
+  const fill = document.getElementById('rest-progress-fill');
+  if (banner) banner.hidden = !state.active || !remaining;
+  if (timer) timer.textContent = formatRemainingSeconds(remaining);
+  if (fill) fill.style.width = `${restProgress(state.restUntil, state.restDurationSeconds) * 100}%`;
+  if (remaining && !restTicker) restTicker = setInterval(updateTimer, 1000);
+  if (!remaining && restTicker) stopRestTicker();
   if (!remaining && state.restUntil) {
-    state.restUntil = 0; repository.clearRest();
+    state.restUntil = 0; state.restDurationSeconds = 0; void repository?.clearRest();
     if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
     toast('Repos terminé !');
   }
@@ -355,8 +431,22 @@ function updateTimer() {
 function detail(id) {
   const session = state.sessions.find(item => item.id === id);
   if (!session) return;
-  const lines = session.exercises.map(exercise => `${exercise.name}\n${exercise.sets.filter(set => set.done).map(set => `${set.kg || 0} kg × ${set.reps}`).join(' / ')}`).join('\n\n');
+  const lines = session.exercises.map(exercise => `${exercise.name}\n${exercise.sets.filter(set => set.done).map(set => formatSetResult(exercise, set)).join(' / ')}`).join('\n\n');
   alert(`${session.programName} · ${session.routineName} — ${new Date(session.finished).toLocaleDateString('fr-FR')}\n\n${lines}`);
+}
+
+function formatSetResult(exercise, set) {
+  const reps = `${set.reps}${exercise.repUnit === 'seconds' ? ' s' : ' reps'}`;
+  if (isPullUp(exercise)) {
+    if (set.loadMode === 'bodyweight') return `Poids du corps × ${reps}`;
+    if (set.loadMode === 'assisted') return `Assistance ${set.kg} kg × ${reps}`;
+    if (set.loadMode === 'weighted') return `+${set.kg} kg × ${reps}`;
+    return `Charge non qualifiée (${set.kg || '—'} kg) × ${reps}`;
+  }
+  if (set.loadMode === 'assisted') return `Assistance ${set.kg} kg × ${reps}`;
+  if (set.loadMode === 'bodyweight') return `Poids du corps × ${reps}`;
+  if (set.loadMode === 'weighted') return `+${set.kg} kg × ${reps}`;
+  return `${set.kg || 0} kg × ${reps}`;
 }
 
 async function exportData() {
@@ -417,20 +507,34 @@ document.addEventListener('click', async event => {
     if (action === 'resume') page('workout');
     if (action === 'toggle-set') {
       const exercise = state.active.exercises[Number(button.dataset.e)], set = exercise.sets[Number(button.dataset.s)];
-      if (!set.done && (set.kg === '' || Number(set.reps) < 1)) return toast('Renseigne les kg et les répétitions');
+      if (!set.done && Number(set.reps) < 1) return toast('Renseigne les répétitions');
+      const modes = exerciseLoadModes(exercise);
+      if (!set.done && modes.length && !modes.includes(set.loadMode)) return toast('Choisis le mode de charge de cette série');
+      if (!set.done && (set.loadMode === 'assisted' || set.loadMode === 'weighted' || !modes.length) && (set.kg === '' || !Number.isFinite(Number(set.kg)))) return toast('Renseigne la charge ou l’assistance en kg');
       set.done = !set.done;
-      if (set.done) { state.restUntil = Date.now() + exercise.restSeconds * 1000; await repository.saveRestUntil(state.restUntil); }
+      if (set.done && exercise.restSeconds > 0) {
+        state.restUntil = Date.now() + exercise.restSeconds * 1000; state.restDurationSeconds = exercise.restSeconds;
+        await repository.saveRestUntil(state.restUntil, state.restDurationSeconds);
+      }
       await persistActive(); render(); if (set.done) encourage();
     }
-    if (action === 'add-set') { const exercise = state.active.exercises[Number(button.dataset.e)], last = exercise.sets.at(-1); exercise.sets.push({ kg: last?.kg ?? '', reps: last?.reps ?? exercise.repMin, done: false }); await persistActive(); render(); }
-    if (action === 'cancel-rest') { state.restUntil = 0; await repository.clearRest(); updateTimer(); }
+    if (action === 'add-set') { const exercise = state.active.exercises[Number(button.dataset.e)], last = exercise.sets.at(-1); exercise.sets.push({ kg: last?.kg ?? '', reps: last?.reps ?? exercise.repMin, ...(exerciseLoadModes(exercise).length && last?.loadMode ? { loadMode: last.loadMode } : {}), done: false }); await persistActive(); render(); }
+    if (action === 'cancel-rest' || action === 'finish-rest') {
+      state.restUntil = 0; state.restDurationSeconds = 0; await repository.clearRest(); updateTimer();
+    }
+    if (action === 'extend-rest') {
+      if (remainingRestSeconds(state.restUntil) > 0) {
+        state.restUntil += 30_000; state.restDurationSeconds += 30;
+        await repository.saveRestUntil(state.restUntil, state.restDurationSeconds); updateTimer();
+      }
+    }
     if (action === 'finish-session') {
       const done = state.active.exercises.flatMap(exercise => exercise.sets).filter(set => set.done).length;
       if (!done) return toast('Valide au moins une série');
       if (!confirm(`Enregistrer la séance avec ${done} séries terminées ?`)) return;
-      await repository.finishSession(); state.active = null; await refresh(); page('progress'); toast('Séance enregistrée');
+      await repository.finishSession(); state.active = null; state.restUntil = 0; state.restDurationSeconds = 0; stopRestTicker(); await refresh(); page('progress'); toast('Séance enregistrée');
     }
-    if (action === 'discard-session' && confirm('Abandonner la séance en cours ?')) { await repository.discardSession(); state.active = null; state.restUntil = 0; await refresh(); }
+    if (action === 'discard-session' && confirm('Abandonner la séance en cours ?')) { await repository.discardSession(); state.active = null; state.restUntil = 0; state.restDurationSeconds = 0; stopRestTicker(); await refresh(); }
     if (action === 'detail') detail(button.dataset.id);
     if (action === 'export') await exportData();
     if (action === 'save-new-program') {
@@ -482,10 +586,29 @@ document.addEventListener('change', async event => {
   if (input.matches('[data-field]') && state.active) {
     const exercise = state.active.exercises[Number(input.dataset.e)], set = exercise?.sets[Number(input.dataset.s)];
     if (!set) return;
-    const value = input.value === '' && input.dataset.field === 'kg' ? '' : Number(input.value);
-    const max = input.dataset.field === 'kg' ? 1000 : 200;
-    if ((value !== '' && (!Number.isFinite(value) || value < 0 || value > max))) { toast('Valeur invalide'); input.value = set[input.dataset.field]; return; }
-    set[input.dataset.field] = value; await persistActive();
+    const field = input.dataset.field;
+    if (field === 'loadMode') {
+      const mode = input.value || null;
+      if (!exerciseLoadModes(exercise).includes(mode)) { toast('Choisis un mode de charge valide'); return; }
+      set.loadMode = mode;
+      // Une charge ancienne sans mode n'est jamais interprétée comme assistance ou lest.
+      set.kg = '';
+      const recommendation = recommendExercise({ exercise, history: state.sessions, loadMode: mode });
+      exercise.progressionRecommendation = { reason: recommendation.reason, previous: recommendation.previous, sets: recommendation.sets };
+      const suggested = recommendation.sets.find(item => item.index === Number(input.dataset.s));
+      if (suggested) {
+        if (suggested.kg !== undefined) set.kg = suggested.kg;
+        set.reps = suggested.reps;
+      }
+      const scrollY = window.scrollY;
+      await persistActive(); render(); window.scrollTo(0, scrollY);
+      return;
+    }
+    if (field === 'techniqueOk') { set.techniqueOk = input.checked; await persistActive(); return; }
+    const value = input.value === '' ? '' : Number(input.value);
+    const max = field === 'kg' ? 1000 : field === 'rir' ? 10 : 200;
+    if (value !== '' && (!Number.isFinite(value) || value < 0 || value > max)) { toast('Valeur invalide'); input.value = set[field] ?? ''; return; }
+    set[field] = value; await persistActive();
   }
   if (input.id === 'exercise-select') drawChart(input.value);
   if (input.id === 'import-file' && input.files[0]) { try { await importData(input.files[0]); } catch (error) { alert(`Import impossible : ${error.message}`); } input.value = ''; }
@@ -499,10 +622,15 @@ document.addEventListener('change', async event => {
 
 window.addEventListener('online', () => { if (authStatus === 'signed-in') { render(); void syncAndSeedBuiltIns(); } });
 window.addEventListener('offline', () => { if (authStatus === 'signed-in') { render(); void syncEngine?.syncNow(); } });
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && authStatus === 'signed-in') void syncAndSeedBuiltIns(); });
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    updateTimer();
+    if (authStatus === 'signed-in') void syncAndSeedBuiltIns();
+  }
+});
 
 (async () => {
-  setInterval(updateTimer, 1000);
+  updateTimer();
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
   try {
     const response = await fetch('./images/exercises/exercise-images.json');

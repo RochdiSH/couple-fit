@@ -91,6 +91,13 @@ test('validates RIR ranges and preserves timed or per-leg repetition units', () 
   assert.equal(validateProgram(timed).sessions[0].exercises[0].repUnit, 'seconds');
   assert.throws(() => validateProgram({ ...ranged, sessions: ranged.sessions.map((session, index) => index ? session : { ...session, exercises: [{ ...ranged.sessions[0].exercises[0], rirMax: 0 }] }) }), /rir/i);
   assert.throws(() => validateProgram({ ...timed, sessions: timed.sessions.map((session, index) => index ? session : { ...session, exercises: [{ ...timed.sessions[0].exercises[0], repUnit: 'minutes' }] }) }), /unité/i);
+  const increments = structuredClone(ranged);
+  increments.sessions[0].exercises[0].loadIncrementKg = 2.5;
+  increments.sessions[0].exercises[0].loadModes = ['bodyweight', 'assisted', 'weighted'];
+  assert.equal(validateProgram(increments).sessions[0].exercises[0].loadIncrementKg, 2.5);
+  assert.deepEqual(validateProgram(increments).sessions[0].exercises[0].loadModes, ['bodyweight', 'assisted', 'weighted']);
+  assert.throws(() => validateProgram({ ...increments, sessions: increments.sessions.map((session, index) => index ? session : { ...session, exercises: [{ ...increments.sessions[0].exercises[0], loadIncrementKg: 0 }] }) }), /incrément/i);
+  assert.throws(() => validateProgram({ ...increments, sessions: increments.sessions.map((session, index) => index ? session : { ...session, exercises: [{ ...increments.sessions[0].exercises[0], loadModes: ['unsupported'] }] }) }), /modes de charge/i);
 });
 
 test('creates an active cycle with a frozen program snapshot and default duration', () => {
@@ -118,6 +125,8 @@ test('starts a session from the frozen cycle snapshot with stable exercise ids',
   assert.equal(session.programId, template.id);
   assert.equal(session.cycleId, cycle.id);
   assert.equal(session.exercises[0].id, 'bench-press');
+  assert.equal(session.exercises[0].prescribedSets, 2);
+  assert.equal(session.exercises[0].sets.length, 2);
   assert.deepEqual(session.exercises[0].sets, [{ kg: '', reps: 6, done: false }, { kg: '', reps: 6, done: false }]);
   assert.throws(() => createTrainingSession({ ...cycle, status: 'completed' }, 'upper-a'), /cycle actif/i);
 });
